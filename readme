@@ -1,0 +1,19 @@
+ACS ACR120-S Smartcard Reader API
+=================================
+
+This is API for ACS ACR120-S Smartcard Reader (serial version)
+I made this because I'm not satisfied with ACS's API.
+
+Usage:
+======
+
+Just include acr120.h header file and static link it with 
+acr120.c, you can also build this as shared library.
+
+Documentations:
+===============
+
+No, because it's pretty simple to use.
+
+
+Ardhan Madras <ajhwb@knac.com>
