@@ -1,8 +1,8 @@
 /**
  *  ACS ACR-120S Smartcard Reader Library
- *  Copyright (C) 2009 - 2011, Ardhan Madras <ajhwb@knac.com>
+ *  Copyright (C) 2009 - 2012, Ardhan Madras <ajhwb@knac.com>
  *
- *  Last modification: 04/02/2011
+ *  Last modification: 03/14/2012
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -19,12 +19,13 @@
  *  Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
  *  ACR-120S BINARY PROTOCOL:
- *   ____________________________________________________________________
+ *  +-----------+-----------+-------------+----------+---------+---------+
  *  |    STX    |    SID    | DATA LENGTH | CMD/DATA |   BCC   |   ETX   |
  *  |   1 byte  |   1 byte  |   1 byte    |  n bytes | 1 byte  |  1 byte |
- *  '-----------'-----------'-------------'----------'---------'---------'
+ *  +-----------+-----------+-------------+----------+---------+---------+
  *
- **/
+ *  BCC is calculating by XOR-ing each byte from SID to CMD/DATA
+ */
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -42,17 +43,26 @@
 
 #define STX 0x2
 #define ETX 0x3
+#define REPLY_TIMEOUT   100000
+#define USEC_PER_SEC    1000000
 
+struct _acr120_ctx {
+    struct termios current_opt;  /* Current terminal option */
+    struct termios old_opt;      /* Old terminal option (to restore on close) */
+    int fd;                      /* The file descriptor */
+    int io_timeo;                /* IO timeout (read/write) in mileseconds */
+    int error;                   /* Error code */
+    unsigned char proto_mode;    /* Protocol mode */
+    unsigned char station_id;    /* Station ID */
+};
 
-int acr120_errno;
-static int acr120_proto_mode;
-static struct termios old;
+typedef struct _acr120_ctx acr120_ctx;
 
 static void dec2nibble(unsigned int, unsigned char*);
 static void nibble2dec(unsigned int*, unsigned char*);
 static int check_bin_error(const unsigned char*, size_t);
 static int check_ascii_error(const unsigned char*, size_t);
-static int acr120_timeout(int, int);
+static int acr120_timeout(acr120_ctx*, int);
 
 static const char *acr120_error[] = {
     "Success",
@@ -81,16 +91,16 @@ static const char *acr120_error[] = {
     "Data error"
 };
 
-#define check_error(ans, nr) \
+#define check_error(ctx, ans, nr) \
 do { \
-if (acr120_proto_mode) { \
+if (ctx->proto_mode) { \
     if (check_bin_error(ans, (nr))) { \
-        acr120_errno = 24; \
+        ctx->error = 23; \
         return ACR120_ERROR; \
     } \
 } else { \
     if (check_ascii_error(ans, (nr))) { \
-        acr120_errno = 24; \
+        ctx->error = 23; \
         return ACR120_ERROR; \
     } \
 } \
@@ -98,16 +108,28 @@ if (acr120_proto_mode) { \
 
 static void dec2nibble(unsigned int value, unsigned char *nibble)
 {
+#if __BYTE_ORDER == __LITTLE_ENDIAN
     nibble[3] = value & 0xff;
     nibble[2] = value >> 8 & 0xff;
     nibble[1] = value >> 16 & 0xff;
     nibble[0] = value >> 24 & 0xff;
+#else
+    nibble[0] = value & 0xff;
+    nibble[1] = value >> 8 & 0xff;
+    nibble[2] = value >> 16 & 0xff;
+    nibble[3] = value >> 24 & 0xff;
+#endif
 }
 
 static void nibble2dec(unsigned int *val, unsigned char *nibble)
 {
+#if __BYTE_ORDER == __LITTLE_ENDIAN
     *val = nibble[3] | (nibble[2] << 8) | 
            (nibble[1] << 16) | (nibble[0] << 24);
+#else
+    *val = nibble[0] | (nibble[1] << 8) | 
+           (nibble[2] << 16) | (nibble[3] << 24);
+#endif
 }
 
 static int check_bin_error(const unsigned char *ans, size_t len)
@@ -125,70 +147,76 @@ static int check_ascii_error(const unsigned char *ans, size_t len)
     return (ans[len - 2] == 0xd && ans[len -1] == 0xa) ? 0 : 1;
 }
 
-const char* acr120_strerror(void)
+const char* acr120_strerror(acr120_ctx *ctx)
 {
-    return acr120_error[acr120_errno - 1];
+    return acr120_error[ctx->error];
 }
 
-int acr120_change_speed(int fd, speed_t speed)
+int acr120_change_speed(acr120_ctx *ctx, speed_t speed)
 {
     int ret;
     struct termios opt;
 
-    ret = tcgetattr(fd, &opt);
+    ret = tcgetattr(ctx->fd, &opt);
     if (ret == -1) {
-        acr120_errno = 2;
+        ctx->error = 1;
         return ACR120_ERROR;
     }
     cfsetispeed(&opt, speed);
     cfsetospeed(&opt, speed);
-    ret = tcsetattr(fd, TCSANOW, &opt);
+    ret = tcsetattr(ctx->fd, TCSANOW, &opt);
     if (ret == -1) {
-        acr120_errno = 4;
+        ctx->error = 3;
         return ACR120_ERROR;
     }
-    acr120_errno = 1;
+    ctx->error = 0;
+    ctx->current_opt = opt;
     return ACR120_SUCCESS;
 }
 
-int acr120_open(const char *dev, unsigned char sid, speed_t speed)
+acr120_ctx *acr120_init(const char *dev, int station_id, speed_t speed, int timeout)
 {
-    int fd, ret;
+    int ret;
     unsigned char cmd[8], ans[6], val;
     size_t bytes = 0;
-    struct termios opt;
+    struct termios old_opt, current_opt;
+    acr120_ctx *ctx;
 
-    fd = open(dev, O_RDWR | O_NOCTTY);
-    if (fd == -1) {
-        acr120_errno = 2;
-        return ACR120_ERROR;
+    ctx = (acr120_ctx*) malloc(sizeof(acr120_ctx));
+    if (!ctx)
+        return NULL;
+
+    ctx->fd = open(dev, O_RDWR | O_NOCTTY);
+    if (ctx->fd == -1) {
+        ctx->error = 1;
+        return ctx;
     }
 
-    ret = tcgetattr(fd, &opt);
+    ret = tcgetattr(ctx->fd, &old_opt);
     if (ret == -1) {
-        close(fd);
-        acr120_errno = 4;
-        return ACR120_ERROR;
+        close(ctx->fd);
+        ctx->error = 3;
+        return ctx;
     }
 
     /* 
      * Set to 8N1, save previous setting to restore on close.
      */
-    memcpy(&old, &opt, sizeof(struct termios));
+    memcpy(&current_opt, &old_opt, sizeof(struct termios));
 
-    cfsetispeed(&opt, speed);
-    cfsetospeed(&opt, speed);
+    cfsetispeed(&current_opt, speed);
+    cfsetospeed(&current_opt, speed);
 
-    opt.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-    opt.c_iflag &= ~(INLCR | ICRNL | IXON | IXOFF);
-    opt.c_oflag &= ~(ONLCR | OCRNL);
-    opt.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
-    opt.c_cflag |= CS8;
-    ret = tcsetattr(fd, TCSANOW, &opt);
+    current_opt.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    current_opt.c_iflag &= ~(INLCR | ICRNL | IXON | IXOFF);
+    current_opt.c_oflag &= ~(ONLCR | OCRNL);
+    current_opt.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
+    current_opt.c_cflag |= CS8;
+    ret = tcsetattr(ctx->fd, TCSANOW, &current_opt);
     if (ret == -1) {
-        close(fd);
-        acr120_errno = 4;
-        return ACR120_ERROR;
+        close(ctx->fd);
+        ctx->error = 3;
+        return ctx;
     }
 
     /*
@@ -198,36 +226,38 @@ int acr120_open(const char *dev, unsigned char sid, speed_t speed)
      */
     snprintf((char *) cmd, 5, "re%.2x", ACR120_REGISTER_PROTOCOL);
     while (bytes < 4) {
-        ret = write(fd, cmd + bytes, 4 - bytes);
+        ret = write(ctx->fd, cmd + bytes, 4 - bytes);
         if (ret <= 0) {
-            acr120_errno = 5;
+            ctx->error = 4;
 reset:
-            tcsetattr(fd, TCSANOW, &old);
-            close(fd);
-            return ACR120_ERROR;
+            tcsetattr(ctx->fd, TCSANOW, &old_opt);
+            close(ctx->fd);
+            return ctx;
         }
         bytes += ret;
     }
 
     bytes = 0;
     while (bytes < 4) {
-        ret = acr120_timeout(fd, -1);
+        if (timeout < 0)
+            timeout = REPLY_TIMEOUT;
+        ret = acr120_timeout(ctx, timeout);
         if (ret == ACR120_ERROR) {
-            if (acr120_errno != 8)
+            if (ctx->error != 7)
                 goto reset;
             goto bin;
         }
 
-        ret = read(fd, ans + bytes, 4 - bytes);
+        ret = read(ctx->fd, ans + bytes, 4 - bytes);
         if (ret <= 0) {
-            acr120_errno = 6;
+            ctx->error = 5;
             goto reset;
         }
         bytes += ret;
     }
 
     if (check_ascii_error(ans, 4)) {
-        acr120_errno = 24;
+        ctx->error = 23;
         goto reset;
     }
 
@@ -241,7 +271,7 @@ reset:
 bin:
 
     cmd[0] = STX;
-    cmd[1] = sid;
+    cmd[1] = station_id;
     cmd[2] = 0x3;
     cmd[3] = 'r';
     cmd[4] = 'e';
@@ -251,9 +281,9 @@ bin:
 
     bytes = 0;
     while (bytes < sizeof(cmd)) {
-        ret = write(fd, cmd + bytes, sizeof(cmd) - bytes);
+        ret = write(ctx->fd, cmd + bytes, sizeof(cmd) - bytes);
         if (ret <= 0) {
-            acr120_errno = 5;
+            ctx->error = 4;
             goto reset;
         }
         bytes += ret;
@@ -261,12 +291,12 @@ bin:
 
     bytes = 0;
     while (bytes < sizeof(ans)) {
-        ret = acr120_timeout(fd, -1);
+        ret = acr120_timeout(ctx, timeout);
         if (ret == ACR120_ERROR)
             goto reset;
-        ret = read(fd, ans + bytes, sizeof(ans) - bytes);
+        ret = read(ctx->fd, ans + bytes, sizeof(ans) - bytes);
         if (ret <= 0) {
-            acr120_errno = 6;
+            ctx->error = 5;
             goto reset;
         }
         bytes += ret;
@@ -278,65 +308,66 @@ bin:
         if (bytes > 3 && ans[2] == 1) {
             switch (ans[3]) {
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     goto reset;
                 case 'I':
-                    acr120_errno = 10;
+                    ctx->error = 9;
                     goto reset;
                 case 'F':
-                    acr120_errno = 13;
+                    ctx->error = 12;
                     goto reset;
             }
         }
     }
 
     if (check_bin_error(ans, sizeof(ans))) {
-        acr120_errno = 24;
+        ctx->error = 23;
         goto reset;
     }
     val = ans[3];
 
 done:
     /* Set protocol mode */
-    acr120_proto_mode = val >> 1 & 0x1;
-    acr120_errno = 1;
-    return fd;
+    ctx->proto_mode = val >> 1 & 0x1;
+    ctx->error = 0;
+    ctx->current_opt = current_opt;
+    ctx->old_opt = old_opt;
+    ctx->station_id = station_id;
+    ctx->io_timeo = timeout;
+    return ctx;
 }
 
-int acr120_close(int fd)
+int acr120_free(acr120_ctx *ctx)
 {
     int ret;
 
     /* Restore previous setting */
-    ret = tcsetattr(fd, TCSANOW, &old);
+    ret = tcsetattr(ctx->fd, TCSANOW, &ctx->old_opt);
     if (ret == -1) {
-        acr120_errno = 4;
+        ctx->error = 3;
         return ACR120_ERROR;
     }
-    ret = close(fd);
+    ret = close(ctx->fd);
     if (ret == -1) {
-        acr120_errno = 3;
+        ctx->error = 2;
         return ACR120_ERROR;
     }
-    acr120_errno = 1;
+    free(ctx);
     return ACR120_SUCCESS;
 }
-
-#define REPLY_TIMEOUT   100000
-#define USEC_PER_SEC    1000000
 
 /*
  * Used for read operation timeout, REPLY_TIEMOUT time
  * (in miliseconds) should be a comfortable value.
  */
-static int acr120_timeout(int fd, int timeout)
+static int acr120_timeout(acr120_ctx *ctx, int timeout)
 {
     int ret;
     fd_set rset;
     struct timeval val;
 
     FD_ZERO(&rset);
-    FD_SET(fd, &rset);
+    FD_SET(ctx->fd, &rset);
 
     if (timeout < 0) val.tv_usec = REPLY_TIMEOUT;
     else if (timeout == 0) val.tv_usec = 0;
@@ -348,33 +379,33 @@ static int acr120_timeout(int fd, int timeout)
         val.tv_usec -= USEC_PER_SEC;
     }
 
-    ret = select(fd + 1, &rset, NULL, NULL, &val);
+    ret = select(ctx->fd + 1, &rset, NULL, NULL, &val);
     if (ret == 0) {
-        acr120_errno = 8;
+        ctx->error = 7;
         return ACR120_ERROR;
     }
     if (ret == -1) {
-        acr120_errno = 7;
+        ctx->error = 6;
         return ACR120_ERROR;
     }
-    if (FD_ISSET(fd, &rset)) {
-        acr120_errno = 1;
+    if (FD_ISSET(ctx->fd, &rset)) {
+        ctx->error = 0;
         return ACR120_SUCCESS;
     }
-    /* Should be never here */
-    acr120_errno = 7;
+    /* Should never reach here */
+    ctx->error = 6;
     return ACR120_ERROR;
 }
 
-int acr120_reset(int fd, unsigned char sid, int reply, int timeout)
+int acr120_reset(acr120_ctx *ctx, int need_reply)
 {
     int ret;
     unsigned char cmd[6], ans[12];
     size_t bytes = 0, nw, nr;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 0x1;
         cmd[3] = 'x';
         cmd[4] = cmd[1] ^ cmd[2] ^ cmd[3];
@@ -388,9 +419,9 @@ int acr120_reset(int fd, unsigned char sid, int reply, int timeout)
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -402,32 +433,32 @@ int acr120_reset(int fd, unsigned char sid, int reply, int timeout)
      * outputed as 'ACR120 24S', bypass the binary error check.
      */
     bytes = 0;
-    while (reply && acr120_proto_mode && bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+    while (need_reply && ctx->proto_mode && bytes < nr) {
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
     }
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_get_id(int fd, unsigned char *id, int timeout)
+int acr120_get_id(acr120_ctx *ctx, unsigned char *id)
 {
     int ret;
     unsigned char cmd[6], ans[6];
     size_t bytes = 0, nw, nr;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
         cmd[1] = 0xff;
         cmd[2] = 0x1;
@@ -443,9 +474,9 @@ int acr120_get_id(int fd, unsigned char *id, int timeout)
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -453,37 +484,37 @@ int acr120_get_id(int fd, unsigned char *id, int timeout)
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
     if (id)
-        *id = acr120_proto_mode ? ans[3] : ans[0];
+        *id = ctx->proto_mode ? ans[3] : ans[0];
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_select(int fd, unsigned char sid, unsigned int *uid, int timeout)
+int acr120_select(acr120_ctx *ctx, unsigned int *uid)
 {
     int ret;
     unsigned char cmd[6], ans[10], uids[4];
     size_t bytes = 0, nr, nw;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 0x1;
         cmd[3] = 's';
         cmd[4] = cmd[1] ^ cmd[2] ^ cmd[3];
@@ -497,9 +528,9 @@ int acr120_select(int fd, unsigned char sid, unsigned int *uid, int timeout)
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -507,44 +538,44 @@ int acr120_select(int fd, unsigned char sid, unsigned int *uid, int timeout)
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 
 rd:
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
 
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 1) {
             if (ans[3] == 'N') {
-                acr120_errno = 9;
+                ctx->error = 8;
                 return ACR120_ERROR;
             }
         }
 
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             if (ans[0] == 'N' && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout(fd, timeout ? timeout : -1);
+                ret = acr120_timeout(ctx, ctx->io_timeo);
                 if (ret == ACR120_SUCCESS)
                     goto rd;
-                else if (ret == ACR120_ERROR && acr120_errno == 8)
-                    acr120_errno = 9;
+                else if (ret == ACR120_ERROR && ctx->error == 7)
+                    ctx->error = 8;
                 return ret;
             }
         }
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
     if (uid) {
-        if (acr120_proto_mode) {
+        if (ctx->proto_mode) {
             memcpy(uids, ans + 3, sizeof(uids));
             nibble2dec(uid, uids);
         }
@@ -554,7 +585,7 @@ rd:
         }
     }
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
@@ -562,16 +593,16 @@ rd:
  * Key ff binary sequence: 02 01 04 6c 01 ff 0d 9a 03 
  * Key aa or bb binary sequence: 02 01 09 6c 01 aa a0 a1 a2 a3 a4 a5 ce 03
  **/
-int acr120_login(int fd, unsigned char sid, unsigned char sector, 
-                mifare_key type, unsigned char *key, int timeout)
+int acr120_login(acr120_ctx *ctx, unsigned char sector, 
+                mifare_key type, unsigned char *key)
 {
     int ret, i;
     unsigned char cmd[18], ans[6];
     size_t bytes = 0, nw, nr;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[3] = 'l';
         cmd[4] = sector;
 
@@ -604,9 +635,9 @@ int acr120_login(int fd, unsigned char sid, unsigned char sector,
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -614,34 +645,34 @@ int acr120_login(int fd, unsigned char sid, unsigned char sector,
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
 
-        if (bytes > 3 && ans[2] == 1 && acr120_proto_mode) {
+        if (bytes > 3 && ans[2] == 1 && ctx->proto_mode) {
 err:
             switch (ans[3]) {
                 case 'L':
-                    check_error(ans, nr);
-                    acr120_errno = 1;
+                    check_error(ctx, ans, nr);
+                    ctx->error = 0;
                     return ACR120_SUCCESS;
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'F':
-                    acr120_errno = 11;
+                    ctx->error = 10;
                     return ACR120_ERROR;
                 case 'E':
-                    acr120_errno = 12;
+                    ctx->error = 11;
                     return ACR120_ERROR;
             }
         }
@@ -649,24 +680,23 @@ err:
         /*
          * ASCII mode, there are only 3 bytes reply for success and error.
          */
-        if (!acr120_proto_mode && bytes == 3)
+        if (!ctx->proto_mode && bytes == 3)
             goto err;
     }
 
-    acr120_errno = 11;
+    ctx->error = 10;
     return ACR120_ERROR;
 }
 
-int acr120_write_block(int fd, unsigned char sid, unsigned char block, 
-                unsigned char *data, int timeout)
+int acr120_write_block(acr120_ctx *ctx, unsigned char block, unsigned char *data)
 {
     int ret, i;
     unsigned char cmd[37], ans[34];
     size_t bytes = 0, nr, nw;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 18;
         cmd[3] = 'w';
         cmd[4] = block;
@@ -692,9 +722,9 @@ int acr120_write_block(int fd, unsigned char sid, unsigned char block,
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -702,35 +732,35 @@ int acr120_write_block(int fd, unsigned char sid, unsigned char block,
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 
 rd:
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 1) {
 err:
             switch (ans[3]) {
                 case 'X':
-                    acr120_errno = 14;
+                    ctx->error = 13;
                     return ACR120_ERROR;
                 case 'U':
-                    acr120_errno = 15;
+                    ctx->error = 14;
                     return ACR120_ERROR;
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'F':
                 case 'I':
-                    acr120_errno = 16;
+                    ctx->error = 15;
                     return ACR120_ERROR;
             }
         }
@@ -741,7 +771,7 @@ err:
          * Lets read for more reply data, if we timeout, that is very likely 
          * data has been transmitted completely.
          */
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             int maybe_error = ans[0] == 'X' ||
                               ans[0] == 'U' ||
                               ans[0] == 'N' ||
@@ -749,11 +779,11 @@ err:
                               ans[0] == 'I';
 
             if (maybe_error && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout(fd, timeout ? timeout : -1);
+                ret = acr120_timeout(ctx, ctx->io_timeo);
                 if (ret == ACR120_SUCCESS)
                     goto rd;
 
-                else if (ret == ACR120_ERROR && acr120_errno == 8) {
+                else if (ret == ACR120_ERROR && ctx->error == 7) {
                     ans[3] = ans[0];
                     goto err;
                 }
@@ -762,14 +792,13 @@ err:
         }
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_write_value(int fd, unsigned char sid, unsigned char block, 
-                unsigned int value, int timeout)
+int acr120_write_value(acr120_ctx *ctx, unsigned char block, unsigned int value)
 {
     int ret, i;
     unsigned char cmd[12], data[4], ans[10];
@@ -777,9 +806,9 @@ int acr120_write_value(int fd, unsigned char sid, unsigned char block,
 
     dec2nibble(value, data);
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 0x7;
         cmd[3] = 'w';
         cmd[4] = 'v';
@@ -802,9 +831,9 @@ int acr120_write_value(int fd, unsigned char sid, unsigned char block,
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -812,40 +841,38 @@ int acr120_write_value(int fd, unsigned char sid, unsigned char block,
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
-            if (ret == ACR120_ERROR)
-                return ret;
-        }
+        ret = acr120_timeout(ctx, ctx->io_timeo);
+        if (ret == ACR120_ERROR)
+            return ret;
 
 rd:
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 1) {
 err:
             switch (ans[3]) {
                 case 'X':
-                   acr120_errno = 14;
+                   ctx->error = 13;
                    return ACR120_ERROR;
                 case 'U':
-                    acr120_errno = 15;
+                    ctx->error = 14;
                     return ACR120_ERROR;
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'F':
                 case 'I':
-                    acr120_errno = 16;
+                    ctx->error = 15;
                     return ACR120_ERROR;
             }
         }
 
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             int maybe_error = ans[0] == 'X' ||
                               ans[0] == 'U' ||
                               ans[0] == 'N' ||
@@ -853,11 +880,11 @@ err:
                               ans[0] == 'I';
 
             if (maybe_error && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout(fd, timeout ? timeout: -1);
+                ret = acr120_timeout(ctx, ctx->io_timeo);
 
                 if (ret == ACR120_SUCCESS)
                     goto rd;
-                else if (ret == ACR120_ERROR && acr120_errno == 8) {
+                else if (ret == ACR120_ERROR && ctx->error == 7) {
                     ans[3] = ans[0];
                     goto err;
                 }
@@ -866,22 +893,21 @@ err:
         }
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_write_register(int fd, unsigned char sid, unsigned char reg,
-                unsigned char value, int timeout)
+int acr120_write_register(acr120_ctx *ctx, unsigned char reg, unsigned char value)
 {
     unsigned char cmd[9], ans[6];
     size_t bytes = 0, nr, nw;
     int ret;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 0x4;
         cmd[3] = 'w';
         cmd[4] = 'e';
@@ -898,9 +924,9 @@ int acr120_write_register(int fd, unsigned char sid, unsigned char reg,
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -908,50 +934,50 @@ int acr120_write_register(int fd, unsigned char sid, unsigned char reg,
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 
 rd:
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
 
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 1) {
 err:
             switch (ans[3]) {
                 case 'X':
-                    acr120_errno = 14;
+                    ctx->error = 13;
                     return ACR120_ERROR;
                 case 'U':
-                    acr120_errno = 15;
+                    ctx->error = 14;
                     return ACR120_ERROR;
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'I':
-                    acr120_errno = 16;
+                    ctx->error = 15;
                     return ACR120_ERROR;
             }
         }
 
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             int maybe_error = ans[0] == 'X' ||
                               ans[0] == 'U' ||
                               ans[0] == 'N' ||
                               ans[0] == 'I';
 
             if (maybe_error && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout (fd, timeout ? timeout : -1);
+                ret = acr120_timeout (ctx, ctx->io_timeo);
                 if (ret == ACR120_SUCCESS)
                     goto rd;
-                else if (ret == ACR120_ERROR && acr120_errno == 8) {
+                else if (ret == ACR120_ERROR && ctx->error == 7) {
                     ans[3] = ans[0];
                     goto err;
                 }
@@ -960,22 +986,21 @@ err:
         }
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_read_block(int fd, unsigned char sid, unsigned char block, 
-                unsigned char *data, int timeout)
+int acr120_read_block(acr120_ctx *ctx, unsigned char block, unsigned char *data)
 {
     int ret;
     unsigned char cmd[7], ans[34];
     size_t bytes = 0, nw, nr;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 2;
         cmd[3] = 'r';
         cmd[4] = block;
@@ -991,9 +1016,9 @@ int acr120_read_block(int fd, unsigned char sid, unsigned char block,
 
     bytes = 0;
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -1001,39 +1026,39 @@ int acr120_read_block(int fd, unsigned char sid, unsigned char block,
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 rd:
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 1) {
 err:
             switch (ans[3]) {
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'F':
-                    acr120_errno = 13;
+                    ctx->error = 12;
                     return ACR120_ERROR;
             }
         }
 
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             int maybe_error = ans[0] == 'N' || ans[0] == 'F';
 
             if (maybe_error && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout(fd, timeout ? timeout : -1);
+                ret = acr120_timeout(ctx, ctx->io_timeo);
                 if (ret == ACR120_SUCCESS)
                     goto rd;
-                else if (ret == ACR120_ERROR && acr120_errno == 8) {
+                else if (ret == ACR120_ERROR && ctx->error == 7) {
                     ans[3] = ans[0];
                     goto err;
                 }
@@ -1042,10 +1067,10 @@ err:
         }
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
     if (data) {
-        if (acr120_proto_mode)
+        if (ctx->proto_mode)
             memcpy(data, ans + 3, 16);
         else {
             char hex[3];
@@ -1056,20 +1081,19 @@ err:
             }
         }
     }
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_read_value(int fd, unsigned char sid, unsigned char block,
-                unsigned int *value, int timeout)
+int acr120_read_value(acr120_ctx *ctx, unsigned char block, unsigned int *value)
 {
     int ret;
     unsigned char cmd[8], ans[10], data[4];
     size_t bytes = 0, nw, nr;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 0x3;
         cmd[3] = 'r';
         cmd[4] = 'v';
@@ -1085,9 +1109,9 @@ int acr120_read_value(int fd, unsigned char sid, unsigned char block,
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -1095,43 +1119,43 @@ int acr120_read_value(int fd, unsigned char sid, unsigned char block,
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 
 rd:
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 0x1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 0x1) {
 err:
             switch (ans[3]) {
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'I':
-                   acr120_errno = 10;
+                   ctx->error = 9;
                    return ACR120_ERROR;
                 case 'F':
-                   acr120_errno = 13;
+                   ctx->error = 12;
                    return ACR120_ERROR;
             }
         }
 
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             int maybe_error = ans[0] == 'N' || ans[0] == 'I' || ans[0] == 'F';
 
             if (maybe_error && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout(fd, timeout ? timeout : -1);
+                ret = acr120_timeout(ctx, ctx->io_timeo);
                 if (ret == ACR120_SUCCESS)
                     goto rd;
-                if (ret == ACR120_ERROR && acr120_errno == 8) {
+                if (ret == ACR120_ERROR && ctx->error == 7) {
                     ans[3] = ans[0];
                     goto err;
                 }
@@ -1140,10 +1164,10 @@ err:
         }
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
     if (value) {
-        if (acr120_proto_mode) {
+        if (ctx->proto_mode) {
             memcpy(data, ans + 3, sizeof(data));
             nibble2dec(value, data);
         } else {
@@ -1151,20 +1175,19 @@ err:
             sscanf((char*) ans, "%x", value);
         }
     }
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_read_register(int fd, unsigned char sid, unsigned char reg, 
-                unsigned char *value, int timeout)
+int acr120_read_register(acr120_ctx *ctx, unsigned char reg, unsigned char *value)
 {
     int ret;
     unsigned char cmd[8], ans[6];
     size_t bytes = 0, nw, nr;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 0x3;
         cmd[3] = 'r';
         cmd[4] = 'e';
@@ -1180,9 +1203,9 @@ int acr120_read_register(int fd, unsigned char sid, unsigned char reg,
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -1190,44 +1213,44 @@ int acr120_read_register(int fd, unsigned char sid, unsigned char reg,
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 rd:
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 1) {
 err:
             switch (ans[3]) {
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'I':
-                    acr120_errno = 10;
+                    ctx->error = 9;
                     return ACR120_ERROR;
                 case 'F':
-                    acr120_errno = 13;
+                    ctx->error = 12;
                     return ACR120_ERROR;
             }
         }
 
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             int maybe_error = ans[0] == 'N' ||
                               ans[1] == 'I' ||
                               ans[2] == 'F';
 
             if (maybe_error && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout(fd, timeout ? timeout : -1);
+                ret = acr120_timeout(ctx, ctx->io_timeo);
                 if (ret == ACR120_SUCCESS)
                     goto rd;
-                else if (ret == ACR120_ERROR && acr120_errno == 8) {
+                else if (ret == ACR120_ERROR && ctx->error == 7) {
                     ans[3] = ans[0];
                     goto err;
                 }
@@ -1236,28 +1259,27 @@ err:
         }
     }
 
-    check_error(ans, nr);
-    if (acr120_proto_mode)
+    check_error(ctx, ans, nr);
+    if (ctx->proto_mode)
         *value = ans[3];
     else {
         ans[2] = 0;
         *value = strtol((char*) ans, 0, 16);
     }
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_copy_block(int fd, unsigned char sid, unsigned char source, 
-                unsigned char dest, int timeout)
+int acr120_copy_block(acr120_ctx *ctx, unsigned char source, unsigned char dest)
 {
     int ret;
     unsigned char cmd[8], ans[10];
     size_t bytes = 0, nw, nr;
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 0x3;
         cmd[3] = '=';
         cmd[4] = source;
@@ -1273,9 +1295,9 @@ int acr120_copy_block(int fd, unsigned char sid, unsigned char source,
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -1283,49 +1305,49 @@ int acr120_copy_block(int fd, unsigned char sid, unsigned char source,
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 rd:
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 1) {
 err:
             switch (ans[3]) {
                 case 'X':
-                    acr120_errno = 22;
+                    ctx->error = 21;
                     return ACR120_ERROR;
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'I':
-                    acr120_errno = 10;
+                    ctx->error = 9;
                     return ACR120_ERROR;
                 case 'F':
-                    acr120_errno = 23;
+                    ctx->error = 22;
                     return ACR120_ERROR;
             }
         }
 
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             int maybe_error = ans[0] == 'X' ||
                               ans[0] == 'N' ||
                               ans[0] == 'I' ||
                               ans[0] == 'F';
 
             if (maybe_error && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout(fd, timeout ? timeout : -1);
+                ret = acr120_timeout(ctx, ctx->io_timeo);
 
                 if (ret == ACR120_SUCCESS)
                     goto rd;
-                else if (ret == ACR120_ERROR && acr120_errno == 8) {
+                else if (ret == ACR120_ERROR && ctx->error == 7) {
                     ans[3] = ans[0];
                     goto err;
                 } else
@@ -1334,14 +1356,13 @@ err:
         }
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_inc_value(int fd, unsigned char sid, unsigned char block,
-                unsigned int inc, int timeout)
+int acr120_inc_value(acr120_ctx *ctx, unsigned char block, unsigned int inc)
 {
     int ret, i;
     unsigned char cmd[12], ans[10], data[4];
@@ -1349,9 +1370,9 @@ int acr120_inc_value(int fd, unsigned char sid, unsigned char block,
 
     dec2nibble(inc, data);
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 6;
         cmd[3] = '+';
         cmd[4] = block;
@@ -1374,9 +1395,9 @@ int acr120_inc_value(int fd, unsigned char sid, unsigned char block,
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -1384,48 +1405,48 @@ int acr120_inc_value(int fd, unsigned char sid, unsigned char block,
 
     bytes = 0;
     while (bytes < sizeof(ans)) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 rd:
-        ret = read(fd, ans + bytes, sizeof(ans) - bytes);
+        ret = read(ctx->fd, ans + bytes, sizeof(ans) - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 1) {
 err:
             switch (ans[3]) {
                 case 'X':
-                    acr120_errno = 17;
+                    ctx->error = 16;
                     return ACR120_ERROR;
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'I':
-                    acr120_errno = 10;
+                    ctx->error = 9;
                     return ACR120_ERROR;
                 case 'F':
-                    acr120_errno = 18;
+                    ctx->error = 17;
                     return ACR120_ERROR;
             }
         }
 
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             int maybe_error = ans[0] == 'X' ||
                               ans[0] == 'N' ||
                               ans[0] == 'I' ||
                               ans[0] == 'F';
 
             if (maybe_error && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout(fd, timeout ? timeout : -1);
+                ret = acr120_timeout(ctx, ctx->io_timeo);
                 if (ret == ACR120_SUCCESS)
                     goto rd;
-                else if (ret == ACR120_ERROR && acr120_errno == 8) {
+                else if (ret == ACR120_ERROR && ctx->error == 7) {
                     ans[3] = ans[0];
                     goto err;
                 }
@@ -1434,14 +1455,13 @@ err:
         }
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_dec_value(int fd, unsigned char sid, unsigned char block,
-                unsigned int dec, int timeout)
+int acr120_dec_value(acr120_ctx *ctx, unsigned char block, unsigned int dec)
 {
     int ret, i;
     unsigned char cmd[12], ans[10], data[4];
@@ -1449,9 +1469,9 @@ int acr120_dec_value(int fd, unsigned char sid, unsigned char block,
 
     dec2nibble(dec, data);
 
-    if (acr120_proto_mode) {
+    if (ctx->proto_mode) {
         cmd[0] = STX;
-        cmd[1] = sid;
+        cmd[1] = ctx->station_id;
         cmd[2] = 6;
         cmd[3] = '-';
         cmd[4] = block;
@@ -1473,9 +1493,9 @@ int acr120_dec_value(int fd, unsigned char sid, unsigned char block,
     }
 
     while (bytes < nw) {
-        ret = write(fd, cmd + bytes, nw - bytes);
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
         if (ret == -1) {
-            acr120_errno = 5;
+            ctx->error = 4;
             return ACR120_ERROR;
         }
         bytes += ret;
@@ -1483,39 +1503,39 @@ int acr120_dec_value(int fd, unsigned char sid, unsigned char block,
 
     bytes = 0;
     while (bytes < nr) {
-        if (timeout) {
-            ret = acr120_timeout(fd, timeout);
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
 rd:
-        ret = read(fd, ans + bytes, nr - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
 
-        if (acr120_proto_mode && bytes > 3 && ans[2] == 1) {
+        if (ctx->proto_mode && bytes > 3 && ans[2] == 1) {
 err:
             switch(ans[3]) {
                 case 'X':
-                    acr120_errno = 19;
+                    ctx->error = 18;
                     return ACR120_ERROR;
                 case 'N':
-                    acr120_errno = 9;
+                    ctx->error = 8;
                     return ACR120_ERROR;
                 case 'I':
-                    acr120_errno = 10;
+                    ctx->error = 9;
                     return ACR120_ERROR;
                 case 'F':
                 case 'E':
-                    acr120_errno = 20;
+                    ctx->error = 19;
                     return ACR120_ERROR;
             }
         }
 
-        if (!acr120_proto_mode && bytes == 3) {
+        if (!ctx->proto_mode && bytes == 3) {
             int maybe_error = ans[0] == 'X' ||
                               ans[0] == 'N' ||
                               ans[0] == 'I' ||
@@ -1523,10 +1543,10 @@ err:
                               ans[0] == 'E';
 
             if (maybe_error && ans[1] == 0xd && ans[2] == 0xa) {
-                ret = acr120_timeout(fd, timeout ? timeout : -1);
+                ret = acr120_timeout(ctx, ctx->io_timeo);
                 if (ret == ACR120_SUCCESS)
                     goto rd;
-                else if (ret == ACR120_ERROR && acr120_errno == 8) {
+                else if (ret == ACR120_ERROR && ctx->error == 7) {
                     ans[3] = ans[0];
                     goto err;
                 }
@@ -1535,31 +1555,46 @@ err:
         }
     }
 
-    check_error(ans, nr);
+    check_error(ctx, ans, nr);
 
-    acr120_errno = 1;
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_power_on(int fd, unsigned char sid, int timeout)
+int acr120_power_on(acr120_ctx *ctx)
 {
     int ret;
     unsigned char cmd[8], ans[6];
-    size_t bytes = 0;
+    size_t bytes = 0, nw, nr;
 
-    cmd[0] = STX;
-    cmd[1] = sid;
-    cmd[2] = 3;
-    cmd[3] = 'p';
-    cmd[4] = 'o';
-    cmd[5] = 'n';
-    cmd[6] = cmd[1] ^ cmd[2] ^ cmd[3] ^ cmd[4] ^ cmd[5];
-    cmd[7] = ETX;
+    if (ctx->proto_mode) {
+        cmd[0] = STX;
+        cmd[1] = ctx->station_id;
+        cmd[2] = 3;
+        cmd[3] = 'p';
+        cmd[4] = 'o';
+        cmd[5] = 'n';
+        cmd[6] = cmd[1] ^ cmd[2] ^ cmd[3] ^ cmd[4] ^ cmd[5];
+        cmd[7] = ETX;
 
-    ret = write(fd, cmd, sizeof(cmd));
-    if (ret == ACR120_ERROR) {
-        acr120_errno = 5;
-        return ret;
+        nw = sizeof(ans);
+        nr = sizeof(cmd);
+    } else {
+        cmd[0] = 'p';
+        cmd[1] = 'o';
+        cmd[2] = 'n';
+
+        nw = 3;
+        nr = 3;
+    }
+
+    while (bytes < nw) {
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
+        if (ret == -1) {
+            ctx->error = 4;
+            return ret;
+        }
+        bytes += ret;
     }
 
     /* 
@@ -1567,58 +1602,82 @@ int acr120_power_on(int fd, unsigned char sid, int timeout)
      * reader will send 6 bytes of characters reply, so we 
      * only receive the buffer to make sure it is empty 
      */
-    while (bytes < sizeof(ans)) {
-        if (timeout) {
-            ret = acr120_timeout(fd, -1);
+    bytes = 0;
+    while (bytes < nr) {
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
-        ret = read(fd, cmd + bytes, sizeof(cmd) - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
     }
-    acr120_errno = 1;
+
+    check_error(ctx, ans, nr);
+
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 
-int acr120_power_off(int fd, unsigned char sid, int timeout)
+int acr120_power_off(acr120_ctx *ctx)
 {
     int ret;
     unsigned char cmd[9], ans[6];
-    size_t bytes = 0;
+    size_t bytes = 0, nw, nr;
 
-    cmd[0] = STX;
-    cmd[1] = sid;
-    cmd[2] = 4;
-    cmd[3] = 'p';
-    cmd[4] = 'o';
-    cmd[5] = 'f';
-    cmd[6] = 'f';
-    cmd[7] = cmd[1] ^ cmd[2] ^ cmd[3] ^ cmd[4] ^ cmd[5] ^ cmd[6];
-    cmd[8] = ETX;
+    if (ctx->proto_mode) {
+        cmd[0] = STX;
+        cmd[1] = ctx->station_id;
+        cmd[2] = 4;
+        cmd[3] = 'p';
+        cmd[4] = 'o';
+        cmd[5] = 'f';
+        cmd[6] = 'f';
+        cmd[7] = cmd[1] ^ cmd[2] ^ cmd[3] ^ cmd[4] ^ cmd[5] ^ cmd[6];
+        cmd[8] = ETX;
 
-    ret = write(fd, cmd, sizeof(cmd));
-    if (ret == ACR120_ERROR) {
-        acr120_errno = 5;
-        return ret;
+        nw = sizeof(cmd);
+        nr = sizeof(ans);
+    } else {
+        cmd[0] = 'p';
+        cmd[1] = 'o';
+        cmd[2] = 'f';
+        cmd[3] = 'f';
+
+        nw = 4;
+        nr = 3;
     }
-    while (bytes < sizeof(ans)) {
-        if (timeout) {
-            ret = acr120_timeout(fd, -1);
+
+    while (bytes < nw) {
+        ret = write(ctx->fd, cmd + bytes, nw - bytes);
+        if (ret == -1) {
+            ctx->error = 4;
+            return ret;
+        }
+    }
+
+    bytes = 0;
+    while (bytes < nr) {
+        if (ctx->io_timeo != 0) {
+            ret = acr120_timeout(ctx, ctx->io_timeo);
             if (ret == ACR120_ERROR)
                 return ret;
         }
-        ret = read(fd, cmd + bytes, sizeof(cmd) - bytes);
+        ret = read(ctx->fd, ans + bytes, nr - bytes);
         if (ret == -1) {
-            acr120_errno = 6;
+            ctx->error = 5;
             return ACR120_ERROR;
         }
         bytes += ret;
     }
-    acr120_errno = 1;
+
+    check_error(ctx, ans, nr);
+
+    ctx->error = 0;
     return ACR120_SUCCESS;
 }
 

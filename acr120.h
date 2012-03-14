@@ -1,8 +1,8 @@
 /**
  *  ACS ACR-120S Smartcard Reader Library
- *  Copyright (C) 2009 - 2011, Ardhan Madras <ajhwb@knac.com>
+ *  Copyright (C) 2009 - 2012, Ardhan Madras <ajhwb@knac.com>
  *
- *  Last modification: 03/29/2011
+ *  Last modification: 03/14/2012
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -40,74 +40,57 @@ typedef enum {
     MIFARE_KEY_FF
 } mifare_key;
 
-/*
- * Connection object representation for future versions :-)
- */
-struct acr120_conn {
-    struct termios opt;
-    struct termios old;
-    int fd;
-    int error;
-    unsigned char proto_mode;
-};
 
-extern int acr120_errno;
+struct _acr120_ctx;
 
-const char* acr120_strerror(void);
+typedef struct _acr120_ctx acr120_ctx;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int acr120_change_speed(int fd, speed_t speed);
+const char* acr120_strerror(acr120_ctx *ctx);
 
-int acr120_open(const char *dev, unsigned char sid, speed_t speed);
+int acr120_change_speed(acr120_ctx *ctx, speed_t speed);
 
-int acr120_close(int fd);
+acr120_ctx *acr120_init(const char *dev, int station_id, speed_t speed, int timeout);
 
-int acr120_reset(int fd, unsigned char sid, int reply, int timeout);
+int acr120_free(acr120_ctx *ctx);
 
-int acr120_get_id(int fd, unsigned char *id, int timeout);
+int acr120_reset(acr120_ctx *ctx, int need_reply);
 
-int acr120_select(int fd, unsigned char sid, unsigned int *uid, int timeout);
+int acr120_get_id(acr120_ctx*, unsigned char *id);
 
-int acr120_login(int fd, unsigned char sid, unsigned char sector, 
-                mifare_key type, unsigned char *key, int timeout);
+int acr120_select(acr120_ctx *ctx, unsigned int *uid);
+
+int acr120_login(acr120_ctx *ctx, unsigned char sector, 
+                mifare_key type, unsigned char *key);
                 
-int acr120_write_block(int fd, unsigned char sid, unsigned char block, 
-                unsigned char *data, int timeout);
-                
-int acr120_write_value(int fd, unsigned char sid, unsigned char block, 
-                unsigned int value, int timeout);
+int acr120_write_block(acr120_ctx *ctx, unsigned char block, unsigned char *data);
 
-int acr120_write_register(int fd, unsigned char sid, unsigned char reg,
-                unsigned char value, int timeout);
+int acr120_write_value(acr120_ctx *ctx, unsigned char block, unsigned int value);
 
-int acr120_read_block(int fd, unsigned char sid, unsigned char block, 
-                unsigned char *data, int timeout);
-                
-int acr120_read_value(int fd, unsigned char sid, unsigned char block,
-                unsigned int *value, int timeout);
+int acr120_write_register(acr120_ctx *ctx, unsigned char reg, unsigned char value);
 
-int acr120_read_register(int fd, unsigned char sid, unsigned char reg, 
-                unsigned char *value, int timeout);
+int acr120_read_block(acr120_ctx *ctx, unsigned char block, unsigned char *data);
 
-int acr120_copy_block(int fd, unsigned char sid, unsigned char source, 
-                unsigned char dest, int timeout);
-                
-int acr120_inc_value(int fd, unsigned char sid, unsigned char block,
-                unsigned int inc, int timeout);
-                
-int acr120_dec_value(int fd, unsigned char sid, unsigned char block,
-                unsigned int dec, int timeout);
-                
-int acr120_power_on(int fd, unsigned char sid, int timeout);
+int acr120_read_value(acr120_ctx *ctx, unsigned char block, unsigned int *value);
 
-int acr120_power_off(int fd, unsigned char sid, int timeout);
+int acr120_read_register(acr120_ctx *ctx, unsigned char reg, unsigned char *value);
+
+int acr120_copy_block(acr120_ctx *ctx, unsigned char source, unsigned char dest);
+
+int acr120_inc_value(acr120_ctx *ctx, unsigned char block, unsigned int inc);
+
+int acr120_dec_value(acr120_ctx *ctx, unsigned char block, unsigned int dec);
+
+int acr120_power_on(acr120_ctx *ctx);
+
+int acr120_power_off(acr120_ctx *ctx);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif
+#endif /* _ACR120_H */
 
