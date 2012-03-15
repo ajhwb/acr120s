@@ -49,13 +49,15 @@ typedef struct _acr120_ctx acr120_ctx;
 extern "C" {
 #endif
 
+int acr120_errno(acr120_ctx *ctx);
+
 const char* acr120_strerror(acr120_ctx *ctx);
 
 int acr120_change_speed(acr120_ctx *ctx, speed_t speed);
 
 acr120_ctx *acr120_init(const char *dev, int station_id, speed_t speed, int timeout);
 
-int acr120_free(acr120_ctx *ctx);
+void acr120_free(acr120_ctx *ctx);
 
 int acr120_reset(acr120_ctx *ctx, int need_reply);
 

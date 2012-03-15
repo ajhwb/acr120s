@@ -108,7 +108,7 @@ if (ctx->proto_mode) { \
 
 static void dec2nibble(unsigned int value, unsigned char *nibble)
 {
-#if __BYTE_ORDER == __LITTLE_ENDIAN
+#if __BYTE_ORDER == __BIG_ENDIAN
     nibble[3] = value & 0xff;
     nibble[2] = value >> 8 & 0xff;
     nibble[1] = value >> 16 & 0xff;
@@ -123,12 +123,10 @@ static void dec2nibble(unsigned int value, unsigned char *nibble)
 
 static void nibble2dec(unsigned int *val, unsigned char *nibble)
 {
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-    *val = nibble[3] | (nibble[2] << 8) | 
-           (nibble[1] << 16) | (nibble[0] << 24);
+#if __BYTE_ORDER == __BIG_ENDIAN
+    *val = nibble[3] | (nibble[2] << 8) | (nibble[1] << 16) | (nibble[0] << 24);
 #else
-    *val = nibble[0] | (nibble[1] << 8) | 
-           (nibble[2] << 16) | (nibble[3] << 24);
+    *val = nibble[0] | (nibble[1] << 8) | (nibble[2] << 16) | (nibble[3] << 24);
 #endif
 }
 
@@ -145,6 +143,11 @@ static int check_bin_error(const unsigned char *ans, size_t len)
 static int check_ascii_error(const unsigned char *ans, size_t len)
 {
     return (ans[len - 2] == 0xd && ans[len -1] == 0xa) ? 0 : 1;
+}
+
+int acr120_errno(acr120_ctx *ctx)
+{
+    return ctx->error;
 }
 
 const char* acr120_strerror(acr120_ctx *ctx)
@@ -194,7 +197,6 @@ acr120_ctx *acr120_init(const char *dev, int station_id, speed_t speed, int time
 
     ret = tcgetattr(ctx->fd, &old_opt);
     if (ret == -1) {
-        close(ctx->fd);
         ctx->error = 3;
         return ctx;
     }
@@ -215,6 +217,7 @@ acr120_ctx *acr120_init(const char *dev, int station_id, speed_t speed, int time
     ret = tcsetattr(ctx->fd, TCSANOW, &current_opt);
     if (ret == -1) {
         close(ctx->fd);
+        ctx->fd = -1;
         ctx->error = 3;
         return ctx;
     }
@@ -232,6 +235,7 @@ acr120_ctx *acr120_init(const char *dev, int station_id, speed_t speed, int time
 reset:
             tcsetattr(ctx->fd, TCSANOW, &old_opt);
             close(ctx->fd);
+            ctx->fd = -1;
             return ctx;
         }
         bytes += ret;
@@ -239,8 +243,6 @@ reset:
 
     bytes = 0;
     while (bytes < 4) {
-        if (timeout < 0)
-            timeout = REPLY_TIMEOUT;
         ret = acr120_timeout(ctx, timeout);
         if (ret == ACR120_ERROR) {
             if (ctx->error != 7)
@@ -337,23 +339,14 @@ done:
     return ctx;
 }
 
-int acr120_free(acr120_ctx *ctx)
+void acr120_free(acr120_ctx *ctx)
 {
-    int ret;
-
     /* Restore previous setting */
-    ret = tcsetattr(ctx->fd, TCSANOW, &ctx->old_opt);
-    if (ret == -1) {
-        ctx->error = 3;
-        return ACR120_ERROR;
-    }
-    ret = close(ctx->fd);
-    if (ret == -1) {
-        ctx->error = 2;
-        return ACR120_ERROR;
+    if (ctx->fd != -1) {
+        tcsetattr(ctx->fd, TCSANOW, &ctx->old_opt);
+        close(ctx->fd);
     }
     free(ctx);
-    return ACR120_SUCCESS;
 }
 
 /*
