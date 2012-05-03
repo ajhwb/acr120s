@@ -68,7 +68,7 @@ int acr120_select(acr120_ctx *ctx, unsigned int *uid);
 int acr120_login(acr120_ctx *ctx, unsigned char sector, 
                 mifare_key type, unsigned char *key);
                 
-int acr120_write_block(acr120_ctx *ctx, unsigned char block, unsigned char *data);
+int acr120_write_block(acr120_ctx *ctx, unsigned char block, const unsigned char *data);
 
 int acr120_write_value(acr120_ctx *ctx, unsigned char block, unsigned int value);
 

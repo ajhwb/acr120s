@@ -655,7 +655,7 @@ err:
     return ACR120_ERROR;
 }
 
-int acr120_write_block(acr120_ctx *ctx, unsigned char block, unsigned char *data)
+int acr120_write_block(acr120_ctx *ctx, unsigned char block, const unsigned char *data)
 {
     int ret, i;
     unsigned char cmd[37], ans[34];
