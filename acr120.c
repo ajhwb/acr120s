@@ -58,8 +58,6 @@ struct _acr120_ctx {
 
 typedef struct _acr120_ctx acr120_ctx;
 
-static void dec2nibble(unsigned int, unsigned char*);
-static void nibble2dec(unsigned int*, unsigned char*);
 static int check_bin_error(const unsigned char*, size_t);
 static int check_ascii_error(const unsigned char*, size_t);
 static int acr120_timeout(acr120_ctx*, int);
@@ -105,30 +103,6 @@ if (ctx->proto_mode) { \
     } \
 } \
 } while (0);
-
-static void dec2nibble(unsigned int value, unsigned char *nibble)
-{
-#if __BYTE_ORDER == __BIG_ENDIAN
-    nibble[3] = value & 0xff;
-    nibble[2] = value >> 8 & 0xff;
-    nibble[1] = value >> 16 & 0xff;
-    nibble[0] = value >> 24 & 0xff;
-#else
-    nibble[0] = value & 0xff;
-    nibble[1] = value >> 8 & 0xff;
-    nibble[2] = value >> 16 & 0xff;
-    nibble[3] = value >> 24 & 0xff;
-#endif
-}
-
-static void nibble2dec(unsigned int *val, unsigned char *nibble)
-{
-#if __BYTE_ORDER == __BIG_ENDIAN
-    *val = nibble[3] | (nibble[2] << 8) | (nibble[1] << 16) | (nibble[0] << 24);
-#else
-    *val = nibble[0] | (nibble[1] << 8) | (nibble[2] << 16) | (nibble[3] << 24);
-#endif
-}
 
 static int check_bin_error(const unsigned char *ans, size_t len)
 {
@@ -570,7 +544,7 @@ rd:
     if (uid) {
         if (ctx->proto_mode) {
             memcpy(uids, ans + 3, sizeof(uids));
-            nibble2dec(uid, uids);
+            *uid = uids[0] << 24 | uids[1] << 16 | uids[2] << 8 | uids[3];
         }
         else {
             ans[8] = 0;
@@ -797,8 +771,6 @@ int acr120_write_value(acr120_ctx *ctx, unsigned char block, unsigned int value)
     unsigned char cmd[12], data[4], ans[10];
     size_t bytes = 0, nr, nw;
 
-    dec2nibble(value, data);
-
     if (ctx->proto_mode) {
         cmd[0] = STX;
         cmd[1] = ctx->station_id;
@@ -806,10 +778,10 @@ int acr120_write_value(acr120_ctx *ctx, unsigned char block, unsigned int value)
         cmd[3] = 'w';
         cmd[4] = 'v';
         cmd[5] = block;
-        cmd[6] = data[0];
-        cmd[7] = data[1];
-        cmd[8] = data[2];
-        cmd[9] = data[3];
+        cmd[6] = value >> 24 & 0xff;
+        cmd[7] = value >> 16 & 0xff;
+        cmd[8] = value >> 8 & 0xff;
+        cmd[9] = value & 0xff;
         cmd[11] = ETX;
 
         for (i = 1, cmd[10] = 0; i < 10; i++)
@@ -1162,7 +1134,7 @@ err:
     if (value) {
         if (ctx->proto_mode) {
             memcpy(data, ans + 3, sizeof(data));
-            nibble2dec(value, data);
+            *value = data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3];
         } else {
             ans[sizeof(ans) - 2] = 0;
             sscanf((char*) ans, "%x", value);
@@ -1361,18 +1333,16 @@ int acr120_inc_value(acr120_ctx *ctx, unsigned char block, unsigned int inc)
     unsigned char cmd[12], ans[10], data[4];
     size_t bytes = 0, nr, nw;
 
-    dec2nibble(inc, data);
-
     if (ctx->proto_mode) {
         cmd[0] = STX;
         cmd[1] = ctx->station_id;
         cmd[2] = 6;
         cmd[3] = '+';
         cmd[4] = block;
-        cmd[5] = data[0];
-        cmd[6] = data[1];
-        cmd[7] = data[2];
-        cmd[8] = data[3];
+        cmd[5] = inc >> 24 & 0xff;
+        cmd[6] = inc >> 16 & 0xff;
+        cmd[7] = inc >> 8 & 0xff;
+        cmd[8] = inc & 0xff;
         cmd[10] = ETX;
 
         for (i = 1, cmd[9] = 0; i < 9; i++)
@@ -1460,18 +1430,16 @@ int acr120_dec_value(acr120_ctx *ctx, unsigned char block, unsigned int dec)
     unsigned char cmd[12], ans[10], data[4];
     size_t bytes = 0, nr, nw;
 
-    dec2nibble(dec, data);
-
     if (ctx->proto_mode) {
         cmd[0] = STX;
         cmd[1] = ctx->station_id;
         cmd[2] = 6;
         cmd[3] = '-';
         cmd[4] = block;
-        cmd[5] = data[0];
-        cmd[6] = data[1];
-        cmd[7] = data[2];
-        cmd[8] = data[3];
+        cmd[5] = dec >> 24 & 0xff;
+        cmd[6] = dec >> 16 & 0xff;
+        cmd[7] = dec >> 8 & 0xff;
+        cmd[8] = dec & 0xff;
         cmd[10] = ETX;
 
         for (i = 1, cmd[9] = 0; i < 9; i++)
