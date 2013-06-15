@@ -32,11 +32,11 @@
 #define ACR120_REGISTER_BUZZER     0x8
 
 
-typedef enum {
-    MIFARE_KEY_AA = 0,
-    MIFARE_KEY_BB,
-    MIFARE_KEY_FF
-} mifare_key;
+enum {
+    ACR120_KEYTYPE_AA = 0,
+    ACR120_KEYTYPE_BB,
+    ACR120_KEYTYPE_FF
+};
 
 enum {
     ACR120_BAUDRATE_9600 = 0,
@@ -71,7 +71,7 @@ int acr120_get_id(acr120_ctx*, unsigned char *id);
 int acr120_select(acr120_ctx *ctx, unsigned int *uid);
 
 int acr120_login(acr120_ctx *ctx, unsigned char sector, 
-                mifare_key type, unsigned char *key);
+                int type, const unsigned char *key);
                 
 int acr120_write_block(acr120_ctx *ctx, unsigned char block, const unsigned char *data);
 

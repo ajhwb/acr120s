@@ -596,7 +596,7 @@ rd:
  * Key aa or bb binary sequence: 02 01 09 6c 01 aa a0 a1 a2 a3 a4 a5 ce 03
  **/
 int acr120_login(acr120_ctx *ctx, unsigned char sector, 
-                mifare_key type, unsigned char *key)
+                int type, const unsigned char *key)
 {
     int ret, i;
     unsigned char cmd[18], ans[6];
@@ -608,7 +608,7 @@ int acr120_login(acr120_ctx *ctx, unsigned char sector,
         cmd[3] = 'l';
         cmd[4] = sector;
 
-        if (type == MIFARE_KEY_FF) {
+        if (type == ACR120_KEYTYPE_FF) {
             cmd[2] = 4;
             cmd[5] = 0xff;
             cmd[6] = 0xd;
@@ -617,7 +617,7 @@ int acr120_login(acr120_ctx *ctx, unsigned char sector,
             nw = 9;
         } else {
             cmd[2] = 9;
-            cmd[5] = (type == MIFARE_KEY_AA) ? 0xaa : 0xbb;
+            cmd[5] = (type == ACR120_KEYTYPE_AA) ? 0xaa : 0xbb;
             memcpy(cmd + 6, key, 6);
             for (i = 1, cmd[12] = 0; i < 12; i++)
                 cmd[12] ^= cmd[i];
@@ -626,11 +626,11 @@ int acr120_login(acr120_ctx *ctx, unsigned char sector,
         cmd[nw - 1] = ETX;
         nr = sizeof(ans);
     } else {
-        if (type == MIFARE_KEY_FF)
+        if (type == ACR120_KEYTYPE_FF)
             snprintf((char*) cmd, sizeof(cmd), "l%.2xffffffffffffff", sector);
         else
             snprintf((char*) cmd, sizeof(cmd), "l%.2x%s%.2x%.2x%.2x%.2x%.2x%.2x",
-                     sector, (type == MIFARE_KEY_AA) ? "aa" : "bb",
+                     sector, (type == ACR120_KEYTYPE_AA) ? "aa" : "bb",
                      key[0], key[1], key[2], key[3], key[4], key[5]);
         nw = sizeof(cmd) - 1;
         nr = 3;
