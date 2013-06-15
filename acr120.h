@@ -1,8 +1,8 @@
 /**
  *  ACS ACR-120S Smartcard Reader Library
- *  Copyright (C) 2009 - 2012, Ardhan Madras <ajhwb@knac.com>
+ *  Copyright (C) 2009 - 2013, Ardhan Madras <ajhwb@knac.com>
  *
- *  Last modification: 03/14/2012
+ *  Last modification: 06/13/2013
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -22,8 +22,6 @@
 #ifndef _ACR120_H
 #define _ACR120_H
 
-#include <termios.h>
-
 #define ACR120_SUCCESS  0
 #define ACR120_ERROR   -1
 
@@ -40,6 +38,13 @@ typedef enum {
     MIFARE_KEY_FF
 } mifare_key;
 
+enum {
+    ACR120_BAUDRATE_9600 = 0,
+    ACR120_BAUDRATE_19200,
+    ACR120_BAUDRATE_38400,
+    ACR120_BAUDRATE_57600,
+    ACR120_BAUDRATE_115200
+};
 
 struct _acr120_ctx;
 
@@ -53,9 +58,9 @@ int acr120_errno(acr120_ctx *ctx);
 
 const char* acr120_strerror(acr120_ctx *ctx);
 
-int acr120_change_speed(acr120_ctx *ctx, speed_t speed);
+int acr120_change_baudrate(acr120_ctx *ctx, int baudrate);
 
-acr120_ctx *acr120_init(const char *dev, int station_id, speed_t speed, int timeout);
+acr120_ctx *acr120_init(const char *dev, int station_id, int baudrate, int timeout);
 
 void acr120_free(acr120_ctx *ctx);
 

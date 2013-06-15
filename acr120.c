@@ -1,8 +1,8 @@
 /**
  *  ACS ACR-120S Smartcard Reader Library
- *  Copyright (C) 2009 - 2012, Ardhan Madras <ajhwb@knac.com>
+ *  Copyright (C) 2009 - 2013, Ardhan Madras <ajhwb@knac.com>
  *
- *  Last modification: 03/14/2012
+ *  Last modification: 06/13/2013
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -129,7 +129,7 @@ const char* acr120_strerror(acr120_ctx *ctx)
     return acr120_error[ctx->error];
 }
 
-int acr120_change_speed(acr120_ctx *ctx, speed_t speed)
+int acr120_change_baudrate(acr120_ctx *ctx, int baudrate)
 {
     int ret;
     struct termios opt;
@@ -139,8 +139,26 @@ int acr120_change_speed(acr120_ctx *ctx, speed_t speed)
         ctx->error = 1;
         return ACR120_ERROR;
     }
-    cfsetispeed(&opt, speed);
-    cfsetospeed(&opt, speed);
+
+    switch (baudrate) {
+        case ACR120_BAUDRATE_19200:
+            baudrate = B19200;
+            break;
+        case ACR120_BAUDRATE_38400:
+            baudrate = B38400;
+            break;
+        case ACR120_BAUDRATE_57600:
+            baudrate = B57600;
+            break;
+        case ACR120_BAUDRATE_115200:
+            baudrate = B115200;
+            break;
+        default:
+            baudrate = B9600;
+    }
+
+    cfsetispeed(&opt, baudrate);
+    cfsetospeed(&opt, baudrate);
     ret = tcsetattr(ctx->fd, TCSANOW, &opt);
     if (ret == -1) {
         ctx->error = 3;
@@ -151,7 +169,7 @@ int acr120_change_speed(acr120_ctx *ctx, speed_t speed)
     return ACR120_SUCCESS;
 }
 
-acr120_ctx *acr120_init(const char *dev, int station_id, speed_t speed, int timeout)
+acr120_ctx *acr120_init(const char *dev, int station_id, int baudrate, int timeout)
 {
     int ret;
     unsigned char cmd[8], ans[6], val;
@@ -180,8 +198,25 @@ acr120_ctx *acr120_init(const char *dev, int station_id, speed_t speed, int time
      */
     memcpy(&current_opt, &old_opt, sizeof(struct termios));
 
-    cfsetispeed(&current_opt, speed);
-    cfsetospeed(&current_opt, speed);
+    switch (baudrate) {
+        case ACR120_BAUDRATE_19200:
+            baudrate = B19200;
+            break;
+        case ACR120_BAUDRATE_38400:
+            baudrate = B38400;
+            break;
+        case ACR120_BAUDRATE_57600:
+            baudrate = B57600;
+            break;
+        case ACR120_BAUDRATE_115200:
+            baudrate = B115200;
+            break;
+        default:
+            baudrate = B9600;
+    }
+
+    cfsetispeed(&current_opt, baudrate);
+    cfsetospeed(&current_opt, baudrate);
 
     current_opt.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
     current_opt.c_iflag &= ~(INLCR | ICRNL | IXON | IXOFF);
